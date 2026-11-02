@@ -72,6 +72,19 @@ export async function getPageConfig(db, env) {
             category_en: 'Global Settings',
         },
         {
+            id: 'defaultLanguage',
+            label: '默认语言',
+            label_en: 'Default Language',
+            type: 'select',
+            options: [
+                { label: '简体中文', value: 'zh-CN', label_en: '简体中文' },
+                { label: 'English', value: 'en', label_en: 'English' },
+            ],
+            default: 'zh-CN',
+            category: '全局设置',
+            category_en: 'Global Settings',
+        },
+        {
             id: 'ownerName',
             label: '图床名称',
             label_en: 'Site Name',
@@ -93,6 +106,17 @@ export async function getPageConfig(db, env) {
             placeholder: 'https://github.com/MarSeventh/CloudFlare-ImgBed',
             tooltip: '点击Logo时跳转的链接，留空则使用默认GitHub链接',
             tooltip_en: 'URL to navigate when clicking the logo. Leave empty for default GitHub link',
+            category: '全局设置',
+            category_en: 'Global Settings',
+        },
+        {
+            id: 'wallpaperEnabled',
+            label: '启用背景图',
+            label_en: 'Enable Background Image',
+            type: 'boolean',
+            default: true,
+            tooltip: '控制所有页面的背景图开关，关闭后将使用纯色背景',
+            tooltip_en: 'Toggle background images across all pages. When off, a solid color background will be used',
             category: '全局设置',
             category_en: 'Global Settings',
         },
@@ -120,8 +144,8 @@ export async function getPageConfig(db, env) {
             id: 'urlPrefix',
             label: '默认URL前缀',
             label_en: 'Default URL Prefix',
-            tooltip: '自定义URL前缀，如：https://img.a.com/file/，留空则使用当前域名 <br/> 设置后将应用于客户端和管理端',
-            tooltip_en: 'Custom URL prefix, e.g. https://img.a.com/file/. Leave empty to use current domain <br/> Applies to both client and admin',
+            tooltip: '自定义URL前缀，如：https://img.a.com/file/，留空则使用当前域名 <br/> 设置后将应用于客户端和管理端 <br/> 该选项用于CDN加速等场景，请确保自定义前缀可访问',
+            tooltip_en: 'Custom URL prefix, e.g. https://img.a.com/file/. Leave empty to use current domain <br/> Applies to both client and admin <br/> This option is intended for scenarios such as CDN acceleration. Make sure the custom prefix is accessible',
             category: '全局设置',
             category_en: 'Global Settings',
         },
@@ -302,8 +326,9 @@ export async function getPageConfig(db, env) {
             if (typeof parsedConfig === 'object' && parsedConfig !== null) {
                 // 搜索config中的id，如果存在则更新
                 for (let i = 0; i < config.length; i++) {
-                    if (parsedConfig[config[i].id]) {
-                        config[i].value = parsedConfig[config[i].id]
+                    const id = config[i].id
+                    if (Object.prototype.hasOwnProperty.call(parsedConfig, id)) {
+                        config[i].value = parsedConfig[id]
                     }
                 }
             }

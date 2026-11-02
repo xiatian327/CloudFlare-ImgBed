@@ -1,4 +1,5 @@
-import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
+import { createS3Client } from '../utils/storage/s3Client.js';
+import { GetObjectCommand } from "@aws-sdk/client-s3";
 import { fetchSecurityConfig } from "../utils/sysConfig";
 import { TelegramAPI } from "../utils/storage/telegramAPI";
 import { DiscordAPI } from "../utils/storage/discordAPI";
@@ -9,6 +10,7 @@ import {
     returnWithCheck, return404, returnBlockImg, isDomainAllowed, FILE_CACHE_CONTROL
 } from './fileTools';
 import { getDatabase } from '../utils/databaseAdapter.js';
+import { normalizeFileType } from '../utils/mimeTypes.js';
 import { authenticate, AUTH_SCOPE } from '../utils/auth/authCore.js';
 import {
     resolveDiscordCredentials,
@@ -18,6 +20,16 @@ import {
     resolveWebDAVCredentials,
 } from '../utils/metadata/channelCredentials.js';
 import { buildCdnFileUrl } from '../utils/metadata/metadataView.js';
+import {
+    isExpired, getExpiresAt, capCacheControl, buildExpiringFileEtag, etagMatches, isMissingRecord
+} from '../utils/fileExpiryHelpers.js';
+import {
+    parseImageTransform,
+    transformImageRequestViaUrl,
+    transformImageResponse,
+    validateImageTransformRequest,
+    validateImageTransformSource,
+} from './imageTransform.js';
 
 
 export async function onRequest(context) {  // Contents of context object
@@ -46,6 +58,12 @@ export async function onRequest(context) {  // Contents of context object
     const url = new URL(request.url);
     context.url = url;
 
+    context.imageTransform = parseImageTransform(url, securityConfig.access);
+    const imageTransformError = validateImageTransformRequest(request, context.imageTransform);
+    if (imageTransformError) {
+        return imageTransformError;
+    }
+
     const Referer = request.headers.get('Referer')
     context.Referer = Referer;
 
@@ -68,9 +86,15 @@ export async function onRequest(context) {  // Contents of context object
         imgRecord.metadata = {};
     }
 
+    // 已到期但尚未被清理的文件按不存在处理，不依赖清理任务是否准时
+    if (isExpired(imgRecord.metadata)) {
+        return new Response('Error: Image Not Found', { status: 404 });
+    }
+    context.fileExpiresAt = getExpiresAt(imgRecord.metadata);
+
     const fileName = imgRecord.metadata?.FileName || fileId;
     const encodedFileName = encodeURIComponent(fileName);
-    const fileType = imgRecord.metadata?.FileType || null;
+    const fileType = normalizeFileType(imgRecord.metadata?.FileType) || null;
 
     // 检查文件可访问状态
     let accessRes = await returnWithCheck(context, imgRecord);
@@ -78,39 +102,95 @@ export async function onRequest(context) {  // Contents of context object
         return accessRes; // 如果不可访问，直接返回
     }
 
+    const imageSourceValidation = validateImageTransformSource(context.imageTransform, env, fileType, fileName);
+    if (imageSourceValidation?.response) {
+        return imageSourceValidation.response;
+    }
+    if (imageSourceValidation?.fallbackToOriginal) {
+        context.imageTransform = { requested: false };
+    }
+
+    // 未配置原生图片处理器时，通过同域名原图 URL 调用 Cloudflare
+    // Image Transformations。Worker 和 Docker 仍使用原有处理器。
+    const urlTransformResponse = await transformImageRequestViaUrl(context);
+    if (urlTransformResponse) {
+        return urlTransformResponse;
+    }
+
+    // 带有效期的文件：浏览器缓存过期后凭 ETag 向服务端确认，未变化时返回 304，不再读取存储
+    const etag = context.fileExpiresAt !== null && !context.imageTransform.requested
+        ? buildExpiringFileEtag(imgRecord.metadata)
+        : null;
+    if (etag && etagMatches(request.headers.get('If-None-Match'), etag)) {
+        return new Response(null, {
+            status: 304,
+            headers: { 'ETag': etag, 'Cache-Control': getFileCacheControl(context) },
+        });
+    }
+
+    return withEtag(await serveFileContent(context, db, imgRecord, fileId, encodedFileName, fileType), etag);
+}
+
+// 按存储渠道读取文件内容
+async function serveFileContent(context, db, imgRecord, fileId, encodedFileName, fileType) {
+    const { request, env, url } = context;
+
     /* Cloudflare R2渠道 */
     if (imgRecord.metadata?.Channel === 'CloudflareR2') {
-        return await handleR2File(context, fileId, encodedFileName, fileType);
+        const response = await handleR2File(context, fileId, encodedFileName, fileType);
+        return await transformImageResponse(context, response);
     }
 
     /* S3渠道 */
     if (imgRecord.metadata?.Channel === "S3") {
-        return await handleS3File(context, imgRecord.metadata, encodedFileName, fileType);
+        const response = await handleS3File(context, imgRecord.metadata, encodedFileName, fileType);
+        return await transformImageResponse(context, response);
     }
 
     /* Discord 渠道 */
     if (imgRecord.metadata?.Channel === 'Discord') {
         // 检查是否为分片文件
         if (imgRecord.metadata?.IsChunked === true) {
-            return await handleDiscordChunkedFile(context, imgRecord, encodedFileName, fileType);
+            const response = await handleDiscordChunkedFile(context, imgRecord, encodedFileName, fileType);
+            return await transformImageResponse(context, response);
         }
-        return await handleDiscordFile(context, imgRecord.metadata, encodedFileName, fileType);
+        const response = await handleDiscordFile(context, imgRecord.metadata, encodedFileName, fileType);
+        return await transformImageResponse(context, response);
     }
 
     /* HuggingFace 渠道 */
     if (imgRecord.metadata?.Channel === 'HuggingFace') {
-        return await handleHuggingFaceFile(context, imgRecord.metadata, encodedFileName, fileType);
+        const response = await handleHuggingFaceFile(context, imgRecord.metadata, encodedFileName, fileType);
+        return await transformImageResponse(context, response);
     }
 
     /* WebDAV 渠道 */
     if (imgRecord.metadata?.Channel === 'WebDAV') {
-        return await handleWebDAVFile(context, imgRecord.metadata, encodedFileName, fileType);
+        const response = await handleWebDAVFile(context, imgRecord.metadata, encodedFileName, fileType);
+        return await transformImageResponse(context, response);
     }
 
     /* 外链渠道 */
     if (imgRecord.metadata?.Channel === 'External') {
-        // 直接重定向到外链
-        return Response.redirect(imgRecord.metadata?.ExternalLink, 302);
+        if (!context.imageTransform.requested) {
+            // 未请求图片处理时维持原有的外链重定向逻辑
+            return Response.redirect(imgRecord.metadata?.ExternalLink, 302);
+        }
+
+        try {
+            const response = await fetch(imgRecord.metadata?.ExternalLink);
+            if (!response.ok) return response;
+
+            const headers = new Headers(response.headers);
+            setCommonHeaders(headers, encodedFileName, fileType, getFileCacheControl(context));
+            return await transformImageResponse(context, new Response(response.body, {
+                status: response.status,
+                statusText: response.statusText,
+                headers,
+            }));
+        } catch (error) {
+            return new Response(`Error: Failed to fetch external image - ${error.message}`, { status: 500 });
+        }
     }
 
     /* Telegram及Telegraph渠道 */
@@ -126,7 +206,8 @@ export async function onRequest(context) {  // Contents of context object
         } else if (imgRecord.metadata?.Channel === 'TelegramNew') {
             // 检查是否为分片文件
             if (imgRecord.metadata?.IsChunked === true) {
-                return await handleTelegramChunkedFile(context, imgRecord, encodedFileName, fileType);
+                const response = await handleTelegramChunkedFile(context, imgRecord, encodedFileName, fileType);
+                return await transformImageResponse(context, response);
             }
 
             TgFileID = imgRecord.metadata?.TgFileId;
@@ -170,9 +251,33 @@ export async function onRequest(context) {  // Contents of context object
             headers,
         });
 
-        return newRes;
+        return await transformImageResponse(context, newRes);
     } catch (error) {
         return new Response('Error: ' + error, { status: 500 });
+    }
+}
+
+function withEtag(response, etag) {
+    if (!etag || (response.status !== 200 && response.status !== 206)) {
+        return response;
+    }
+    const tagged = new Response(response.body, response);
+    tagged.headers.set('ETag', etag);
+    return tagged;
+}
+
+/**
+ * Worker 入口命中缓存后、返回前调用（见 deploy/worker/workerCache.js）
+ * 只有仍存在且永久的文件可以使用共享缓存：缓存写入后文件可能已被删除、改为有期限或到期
+ */
+export async function isCachedResponseServable(context) {
+    try {
+        const fileId = decodeURIComponent(context.params.path).split(',').join('/');
+        const record = await getDatabase(context.env).getWithMetadata(fileId);
+        return !isMissingRecord(record) && getExpiresAt(record.metadata) === null;
+    } catch (error) {
+        console.warn('Failed to validate cached file response:', error.message);
+        return false;
     }
 }
 
@@ -197,14 +302,15 @@ async function buildFileAccessContext(context) {
     return fileAccess;
 }
 
+// 带有效期的文件只允许私有缓存，且缓存时长不超过剩余有效时间
 function getFileCacheControl(context) {
-    return context.fileAccess?.cacheControl;
+    return capCacheControl(context.fileAccess?.cacheControl, context.fileExpiresAt);
 }
 
 function getChunkedFileCacheControl(context) {
     return getFileCacheControl(context) === FILE_CACHE_CONTROL.NO_STORE
         ? FILE_CACHE_CONTROL.NO_STORE
-        : FILE_CACHE_CONTROL.PRIVATE;
+        : capCacheControl(FILE_CACHE_CONTROL.PRIVATE, context.fileExpiresAt);
 }
 
 
@@ -763,15 +869,7 @@ async function handleS3FileViaAPI(context, metadata, encodedFileName, fileType) 
     const db = getDatabase(env);
     const s3Credentials = await resolveS3Credentials(db, env, metadata);
 
-    const s3Client = new S3Client({
-        region: s3Credentials.region || "auto",
-        endpoint: s3Credentials.endpoint,
-        credentials: {
-            accessKeyId: s3Credentials.accessKeyId,
-            secretAccessKey: s3Credentials.secretAccessKey
-        },
-        forcePathStyle: s3Credentials.pathStyle || false
-    });
+    const s3Client = createS3Client(s3Credentials);
 
     const bucketName = s3Credentials.bucketName;
     const key = s3Credentials.key;
